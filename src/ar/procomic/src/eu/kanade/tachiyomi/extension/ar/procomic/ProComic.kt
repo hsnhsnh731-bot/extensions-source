@@ -86,9 +86,11 @@ abstract class ProComic : KeiSource() {
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val document = client.get("$baseUrl${chapter.url}".toHttpUrl()).asJsoup()
-        val pageUrls = document.select("script")
-            .asSequence()
-            .flatMap { APP_IMAGE_REGEX.findAll(it.html()).map { match -> match.value } }
+        // نجمع كل محتوى وسوم <script> بنص واحد متواصل أولاً، عشان روابط الصور
+        // المقطوعة بين وسمين متتاليين تتلزّق وتصير قابلة للمطابقة الكاملة.
+        val payload = document.select("script").joinToString(separator = "") { it.html() }
+        val pageUrls = APP_IMAGE_REGEX.findAll(payload)
+            .map { it.value }
             .distinct()
             .toList()
 
