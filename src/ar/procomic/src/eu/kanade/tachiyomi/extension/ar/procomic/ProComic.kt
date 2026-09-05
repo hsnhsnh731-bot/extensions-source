@@ -158,8 +158,8 @@ abstract class ProComic : KeiSource() {
         this.url = url
         title = this@toSManga.title
         description = metadata?.descriptions?.get("ar") ?: description
-        author = metadata?.author
-        artist = metadata?.artist
+        author = metadata?.author?.joinToString()
+        artist = metadata?.artist?.joinToString()
         genre = metadata?.genres?.joinToString()
         thumbnail_url = thumbnail
         status = when {
@@ -204,8 +204,8 @@ abstract class ProComic : KeiSource() {
 
     @Serializable
     private class ContentMetadataDto(
-        val author: String? = null,
-        val artist: String? = null,
+        val author: List<String> = emptyList(),
+        val artist: List<String> = emptyList(),
         val genres: List<String> = emptyList(),
         val descriptions: Map<String, String> = emptyMap(),
     )
