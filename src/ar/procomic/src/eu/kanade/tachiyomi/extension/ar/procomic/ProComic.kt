@@ -14,7 +14,10 @@ import keiyoushi.utils.asJsoup
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -154,12 +157,19 @@ abstract class ProComic : KeiSource() {
         return MangasPage(mangas, meta.page < meta.pages)
     }
 
+    private fun JsonElement?.asStringList(): List<String> = when (this) {
+        null -> emptyList()
+        is JsonArray -> mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+        is JsonPrimitive -> contentOrNull?.let { listOf(it) } ?: emptyList()
+        else -> emptyList()
+    }
+
     private fun ContentDto.toSManga(url: String = "$slug-$id") = SManga.create().apply {
         this.url = url
         title = this@toSManga.title
         description = metadata?.descriptions?.get("ar") ?: description
-        author = metadata?.author?.joinToString()
-        artist = metadata?.artist?.joinToString()
+        author = metadata?.author.asStringList().joinToString().ifBlank { null }
+        artist = metadata?.artist.asStringList().joinToString().ifBlank { null }
         genre = metadata?.genres?.joinToString()
         thumbnail_url = thumbnail
         status = when {
@@ -204,8 +214,8 @@ abstract class ProComic : KeiSource() {
 
     @Serializable
     private class ContentMetadataDto(
-        val author: List<String> = emptyList(),
-        val artist: List<String> = emptyList(),
+        val author: JsonElement? = null,
+        val artist: JsonElement? = null,
         val genres: List<String> = emptyList(),
         val descriptions: Map<String, String> = emptyMap(),
     )
