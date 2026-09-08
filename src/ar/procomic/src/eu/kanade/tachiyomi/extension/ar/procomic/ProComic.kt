@@ -11,13 +11,14 @@ import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
+import keiyoushi.utils.jsonInstance
 import keiyoushi.utils.parseAs
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -37,7 +38,8 @@ abstract class ProComic : KeiSource() {
         add("Referer", "$baseUrl/")
     }
 
-    override fun OkHttpClient.Builder.configureClient() = rateLimit(2)
+    override fun OkHttpClient.Builder.configureClient() =
+        rateLimit(2).addInterceptor(ProComicMapInterceptor(this@ProComic))
 
     override suspend fun getPopularManga(page: Int): MangasPage = getContentPage(page, "popular")
 
@@ -89,14 +91,60 @@ abstract class ProComic : KeiSource() {
         // نجمع كل محتوى وسوم <script> بنص واحد متواصل أولاً، عشان روابط الصور
         // المقطوعة بين وسمين متتاليين تتلزّق وتصير قابلة للمطابقة الكاملة.
         val payload = document.select("script").joinToString(separator = "") { it.html() }
+
         val pageUrls = APP_IMAGE_REGEX.findAll(payload)
             .map { it.value }
             .distinct()
             .toList()
 
-        return pageUrls.mapIndexed { index, imageUrl ->
+        val pages = pageUrls.mapIndexed { index, imageUrl ->
             Page(index, imageUrl = imageUrl)
+        }.toMutableList()
+
+        // ============================================================
+        // دعم الصفحات المؤجلة (deferredMedia): بعض الفصول تحمّل فقط أول
+        // splitIndex صورة داخل HTML الأولي، والباقي يحتاج طلب إضافي +
+        // فك تشفير AES-GCM + تجميع قطع (jigsaw) عبر ProComicMapInterceptor.
+        // ============================================================
+        val chapterId = chapter.url.substringAfterLast("-").toLongOrNull()
+        val deferredBlock = DEFERRED_MEDIA_REGEX.find(payload)?.groupValues?.get(1)
+        val deferredToken = deferredBlock?.let { TOKEN_REGEX.find(it)?.groupValues?.get(1) }
+
+        if (chapterId != null && deferredToken != null) {
+            val splitIndex = deferredBlock
+                ?.let { SPLIT_INDEX_REGEX.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+                ?: pages.size
+
+            try {
+                val deferredData = fetchDeferredMedia(
+                    client = client,
+                    json = jsonInstance,
+                    baseUrl = baseUrl,
+                    chapterId = chapterId,
+                    deferredToken = deferredToken,
+                    splitIndex = splitIndex,
+                )
+
+                // صور إضافية مباشرة (لو رجعت غير مشفّرة)
+                deferredData.images.forEach { imageUrl ->
+                    pages.add(Page(pages.size, imageUrl = imageUrl))
+                }
+
+                // خرائط محمية تحتاج فك تشفير وتجميع قطع؛ نخزّنها بذاكرة مؤقتة
+                // ونضيف صفحات وهمية تشير للـ Interceptor بدل رابط صورة مباشر.
+                if (deferredData.maps.isNotEmpty()) {
+                    ProComicMapCache.store(chapterId, deferredData.maps)
+                    deferredData.maps.indices.forEach { mapIndex ->
+                        val internalUrl = "https://$PROCOMIC_MAP_HOST/$chapterId/$mapIndex"
+                        pages.add(Page(pages.size, imageUrl = internalUrl))
+                    }
+                }
+            } catch (e: Exception) {
+                // فشل جلب الوسائط المؤجلة لا يجب أن يمنع عرض الصفحات المتوفرة أصلًا.
+            }
         }
+
+        return pages
     }
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/ar/${manga.url}"
@@ -243,5 +291,10 @@ abstract class ProComic : KeiSource() {
         const val PAGE_SIZE = 100
         val SUPPORTED_TYPES = setOf("manga", "manhua", "manhwa")
         val APP_IMAGE_REGEX = Regex("""https://app\.procomic\.pro/chapters/[^"\\\s]+""")
+
+        // ثوابت استخراج بيانات الوسائط المؤجلة (deferredMedia) من RSC payload
+        val DEFERRED_MEDIA_REGEX = Regex(""""deferredMedia":\{([^{}]*)\}""")
+        val TOKEN_REGEX = Regex(""""token":"([^"]+)"""")
+        val SPLIT_INDEX_REGEX = Regex(""""splitIndex":(\d+)""")
     }
 }
