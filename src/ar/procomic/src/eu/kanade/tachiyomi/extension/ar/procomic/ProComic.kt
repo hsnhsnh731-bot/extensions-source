@@ -13,12 +13,12 @@ import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.jsonInstance
 import keiyoushi.utils.parseAs
+import kotlinx.serialization.SerialName
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -38,8 +38,7 @@ abstract class ProComic : KeiSource() {
         add("Referer", "$baseUrl/")
     }
 
-    override fun OkHttpClient.Builder.configureClient() =
-        rateLimit(2).addInterceptor(ProComicMapInterceptor(this@ProComic))
+    override fun OkHttpClient.Builder.configureClient() = rateLimit(2).addInterceptor(ProComicMapInterceptor(this@ProComic))
 
     override suspend fun getPopularManga(page: Int): MangasPage = getContentPage(page, "popular")
 
