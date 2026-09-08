@@ -1,4 +1,4 @@
-/**
+/*
  * DeferredMediaReader.kt
  *
  * يطبق آلية جلب وفك تشفير صفحات الفصول المؤجلة (deferred media) لموقع procomic.pro.
