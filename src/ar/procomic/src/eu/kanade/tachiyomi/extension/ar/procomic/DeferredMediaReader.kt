@@ -484,14 +484,13 @@ fun assembleReconstructedImage(
 }
 
 /** يوقّع الرابط فقط لو محتاج توقيع، بدون تفجير الاستثناء لو فشل التوقيع (fallback للرابط الأصلي) */
-private fun buildSignedImageUrlSafely(client: OkHttpClient, baseUrl: String, url: String): String {
-    return try {
+private fun buildSignedImageUrlSafely(client: OkHttpClient, baseUrl: String, url: String): String =
+    try {
         val json = Json { ignoreUnknownKeys = true }
         buildSignedImageUrl(client, json, baseUrl, url)
     } catch (e: Exception) {
         url
     }
-}
 
 // ============================================================
 // اكتشاف مهم (جلسة تحليل HttpSource.kt الرسمي من مستودع Mihon):
@@ -517,9 +516,7 @@ object ProComicMapCache {
         cache[chapterId] = maps
     }
 
-    fun get(chapterId: Long, mapIndex: Int): MapEntry? {
-        return cache[chapterId]?.getOrNull(mapIndex)
-    }
+    fun get(chapterId: Long, mapIndex: Int): MapEntry? = cache[chapterId]?.getOrNull(mapIndex)
 }
 
 // ============================================================
@@ -579,15 +576,14 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
         }
     }
 
-    private fun errorResponse(request: Request, code: Int, message: String): Response {
-        return Response.Builder()
+    private fun errorResponse(request: Request, code: Int, message: String): Response =
+        Response.Builder()
             .request(request)
             .protocol(Protocol.HTTP_1_1)
             .code(code)
             .message(message)
             .body(ByteArray(0).toResponseBody(null))
             .build()
-    }
 }
 
 // ============================================================
