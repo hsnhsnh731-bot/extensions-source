@@ -37,10 +37,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.util.Base64
 import keiyoushi.utils.jsonInstance
-import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -310,11 +311,17 @@ fun computePieceRects(map: ReconstructionMap): List<PieceRect> {
 
         val colOffsets = IntArray(cols)
         var acc = 0
-        for (i in 0 until cols) { colOffsets[i] = acc; acc += colWidths[i] }
+        for (i in 0 until cols) {
+            colOffsets[i] = acc
+            acc += colWidths[i]
+        }
 
         val rowOffsets = IntArray(rows)
         acc = 0
-        for (i in 0 until rows) { rowOffsets[i] = acc; acc += rowHeights[i] }
+        for (i in 0 until rows) {
+            rowOffsets[i] = acc
+            acc += rowHeights[i]
+        }
 
         return List(pieceCount) { index ->
             val col = index % cols
@@ -336,13 +343,26 @@ fun computePieceRects(map: ReconstructionMap): List<PieceRect> {
     val sizes = IntArray(segments) { i -> (baseSize + if (i < extra) 1 else 0).coerceAtLeast(1) }
     val offsets = IntArray(segments)
     var acc2 = 0
-    for (i in 0 until segments) { offsets[i] = acc2; acc2 += sizes[i] }
+    for (i in 0 until segments) {
+        offsets[i] = acc2
+        acc2 += sizes[i]
+    }
 
     return List(pieceCount) { index ->
         if (kind == "vertical") {
-            PieceRect(left = offsets.getOrElse(index) { 0 }, top = 0, width = sizes.getOrElse(index) { width }, height = height)
+            PieceRect(
+                left = offsets.getOrElse(index) { 0 },
+                top = 0,
+                width = sizes.getOrElse(index) { width },
+                height = height,
+            )
         } else {
-            PieceRect(left = 0, top = offsets.getOrElse(index) { 0 }, width = width, height = sizes.getOrElse(index) { height })
+            PieceRect(
+                left = 0,
+                top = offsets.getOrElse(index) { 0 },
+                width = width,
+                height = sizes.getOrElse(index) { height },
+            )
         }
     }
 }
@@ -374,12 +394,14 @@ fun buildSignedImageUrl(
 
     client.newCall(signRequest).execute().use { response ->
         val body = response.body?.string().orEmpty()
-        val jsonObj = json.parseToJsonElement(body).let { it as? kotlinx.serialization.json.JsonObject }
-            ?: throw Exception("Invalid sign response")
-        val token = jsonObj["token"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
-            ?: throw Exception("Sign response missing token")
-        val expires = jsonObj["expires"]?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
-            ?: throw Exception("Sign response missing expires")
+        val parsed = json.parseToJsonElement(body)
+        val jsonObj = parsed as? JsonObject ?: throw Exception("Invalid sign response")
+
+        val tokenElement = jsonObj["token"] as? JsonPrimitive
+        val token = tokenElement?.content ?: throw Exception("Sign response missing token")
+
+        val expiresElement = jsonObj["expires"] as? JsonPrimitive
+        val expires = expiresElement?.content ?: throw Exception("Sign response missing expires")
 
         val encodedUrl = java.net.URLEncoder.encode(rawUrl, "UTF-8")
         return "$baseUrl/api/cdn-image?expires=$expires&token=$token&url=$encodedUrl"
@@ -388,15 +410,23 @@ fun buildSignedImageUrl(
 
 /** يحل رابط قطعة نسبي إلى رابط مطلق كامل، إذا لزم الأمر */
 fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String {
-    return when {
-        rawPiece.startsWith("http://") || rawPiece.startsWith("https://") -> rawPiece
-        rawPiece.startsWith("/") -> baseUrl.trimEnd('/') + rawPiece
-        !cdnPath.isNullOrBlank() -> "https://$cdnPath.procomic.pro/$rawPiece".let {
-            // fallback بسيط: لو cdnPath هو "cdn2" فقط
-            if (cdnPath.contains(".")) "https://$cdnPath/$rawPiece" else it
-        }
-        else -> rawPiece
+    if (rawPiece.startsWith("http://") || rawPiece.startsWith("https://")) {
+        return rawPiece
     }
+
+    if (rawPiece.startsWith("/")) {
+        return baseUrl.trimEnd('/') + rawPiece
+    }
+
+    if (!cdnPath.isNullOrBlank()) {
+        return if (cdnPath.contains(".")) {
+            "https://$cdnPath/$rawPiece"
+        } else {
+            "https://$cdnPath.procomic.pro/$rawPiece"
+        }
+    }
+
+    return rawPiece
 }
 
 private fun downloadPieceBitmap(client: OkHttpClient, url: String): Bitmap {
