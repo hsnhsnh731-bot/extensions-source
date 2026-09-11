@@ -440,6 +440,8 @@ fun fetchDeferredMedia(
     val request = Request.Builder()
         .url(url)
         .header("Accept", "application/json")
+        .header("Referer", "$baseUrl/")
+        .header("Origin", baseUrl)
         .build()
 
     client.newCall(request).execute().use { response ->
@@ -477,6 +479,8 @@ fun fetchSessionKey(
     val request = Request.Builder()
         .url(url)
         .header("Accept", "application/json")
+        .header("Referer", "$baseUrl/")
+        .header("Origin", baseUrl)
         .build()
 
     client.newCall(request).execute().use { response ->
@@ -637,6 +641,8 @@ fun buildSignedImageUrl(
     val payload = """{"url":"$rawUrl"}"""
     val signRequest = Request.Builder()
         .url("$baseUrl/api/cdn-image/sign")
+        .header("Referer", "$baseUrl/")
+        .header("Origin", baseUrl)
         .post(payload.toRequestBody("application/json".toMediaType()))
         .build()
 
