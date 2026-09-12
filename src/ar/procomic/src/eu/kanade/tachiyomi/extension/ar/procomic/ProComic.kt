@@ -446,7 +446,7 @@ fun fetchDeferredMedia(
     chapterId: Long,
     deferredToken: String,
     splitIndex: Int,
-): DeferredMediaData {
+): DeferredMediaData = retrying {
     val url = "$baseUrl/chapter-deferred-media/$chapterId" +
         "?token=${URLEncoder.encode(deferredToken, "UTF-8")}" +
         "&split=$splitIndex"
@@ -459,9 +459,12 @@ fun fetchDeferredMedia(
         .build()
 
     client.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) {
+            throw Exception("Failed to fetch chapter-deferred-media: HTTP ${response.code}")
+        }
         val body = response.body?.string().orEmpty()
         val envelope = json.decodeFromString(DeferredMediaEnvelope.serializer(), body)
-        return envelope.data ?: DeferredMediaData()
+        envelope.data ?: DeferredMediaData()
     }
 }
 
@@ -487,7 +490,7 @@ fun fetchSessionKey(
     json: Json,
     baseUrl: String,
     chapterId: Long,
-): SecretKeySpec {
+): SecretKeySpec = retrying {
     val url = "$baseUrl/chapter-map-session-key/$chapterId?legacy=1"
 
     val request = Request.Builder()
@@ -506,7 +509,7 @@ fun fetchSessionKey(
         val rawKey = envelope.data?.key
             ?: throw Exception("chapter-map-session-key response missing 'key'")
         val keyBytes = decodeBase64Url(rawKey)
-        return SecretKeySpec(keyBytes, "AES")
+        SecretKeySpec(keyBytes, "AES")
     }
 }
 
@@ -642,6 +645,29 @@ fun computePieceRects(map: ReconstructionMap): List<PieceRect> {
 private const val CDN2_HOST_MARKER = "cdn2.procomic.pro"
 
 /**
+ * يعيد تنفيذ [block] عدة مرات لو رمى استثناء، مع تأخير بسيط بينها.
+ *
+ * السبب: بعض فشل تحميل الصفحات ليس خطأ منطقي ثابت، بل فشل شبكي مؤقت (مهلة
+ * اتصال، أو رفض عابر من الخادم بسبب تزامن عدة طلبات توقيع/تنزيل قطع بنفس
+ * اللحظة عند تحميل Mihon لعدة صفحات بالتوازي). إعادة المحاولة تلقائيًا تحل
+ * أغلب هذي الحالات بدل ما تفشل الصفحة نهائيًا من أول عثرة.
+ */
+private fun <T> retrying(times: Int = 3, delayMs: Long = 350, block: (attempt: Int) -> T): T {
+    var lastError: Exception? = null
+    for (attempt in 1..times) {
+        try {
+            return block(attempt)
+        } catch (e: Exception) {
+            lastError = e
+            if (attempt < times) {
+                Thread.sleep(delayMs * attempt)
+            }
+        }
+    }
+    throw lastError ?: Exception("Unknown error after $times attempts")
+}
+
+/**
  * يوقّع رابط cdn2:
  * POST /api/cdn-image/sign { "url": rawCdn2Url } -> { token, expires }
  * ثم يبني الرابط النهائي: /api/cdn-image?expires=..&token=..&url=..
@@ -654,27 +680,32 @@ fun buildSignedImageUrl(
 ): String {
     if (CDN2_HOST_MARKER !in rawUrl) return rawUrl
 
-    val payload = """{"url":"$rawUrl"}"""
-    val signRequest = Request.Builder()
-        .url("$baseUrl/api/cdn-image/sign")
-        .header("Referer", "$baseUrl/")
-        .header("Origin", baseUrl)
-        .post(payload.toRequestBody("application/json".toMediaType()))
-        .build()
+    return retrying {
+        val payload = """{"url":"$rawUrl"}"""
+        val signRequest = Request.Builder()
+            .url("$baseUrl/api/cdn-image/sign")
+            .header("Referer", "$baseUrl/")
+            .header("Origin", baseUrl)
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
 
-    client.newCall(signRequest).execute().use { response ->
-        val body = response.body?.string().orEmpty()
-        val parsed = json.parseToJsonElement(body)
-        val jsonObj = parsed as? JsonObject ?: throw Exception("Invalid sign response")
+        client.newCall(signRequest).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw Exception("cdn-image/sign failed: HTTP ${response.code}")
+            }
+            val body = response.body?.string().orEmpty()
+            val parsed = json.parseToJsonElement(body)
+            val jsonObj = parsed as? JsonObject ?: throw Exception("Invalid sign response")
 
-        val tokenElement = jsonObj["token"] as? JsonPrimitive
-        val token = tokenElement?.content ?: throw Exception("Sign response missing token")
+            val tokenElement = jsonObj["token"] as? JsonPrimitive
+            val token = tokenElement?.content ?: throw Exception("Sign response missing token")
 
-        val expiresElement = jsonObj["expires"] as? JsonPrimitive
-        val expires = expiresElement?.content ?: throw Exception("Sign response missing expires")
+            val expiresElement = jsonObj["expires"] as? JsonPrimitive
+            val expires = expiresElement?.content ?: throw Exception("Sign response missing expires")
 
-        val encodedUrl = URLEncoder.encode(rawUrl, "UTF-8")
-        return "$baseUrl/api/cdn-image?expires=$expires&token=$token&url=$encodedUrl"
+            val encodedUrl = URLEncoder.encode(rawUrl, "UTF-8")
+            "$baseUrl/api/cdn-image?expires=$expires&token=$token&url=$encodedUrl"
+        }
     }
 }
 
@@ -704,12 +735,12 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
     return rawPiece
 }
 
-private fun downloadPieceBitmap(client: OkHttpClient, url: String): Bitmap {
+private fun downloadPieceBitmap(client: OkHttpClient, url: String): Bitmap = retrying {
     val request = Request.Builder().url(url).build()
     client.newCall(request).execute().use { response ->
         if (!response.isSuccessful) throw Exception("Failed to download piece: HTTP ${response.code} ($url)")
         val bytes = response.body?.bytes() ?: throw Exception("Empty piece body ($url)")
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             ?: throw Exception("Failed to decode piece bitmap ($url)")
     }
 }
@@ -875,7 +906,7 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
                 .body(imageBytes.toResponseBody("image/jpeg".toMediaType()))
                 .build()
         } catch (e: Exception) {
-            errorResponse(request, 500, e.message ?: "Failed to assemble protected page")
+            diagnosticImageResponse(request, "MAP #${mapEntry.method}: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -897,28 +928,30 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
             val resolvedUrl = resolvePieceUrl(source.baseUrl, rawImage, "cdn2")
             val signedUrl = buildSignedImageUrlSafely(source.client, source.baseUrl, resolvedUrl)
 
-            val imageRequest = Request.Builder()
-                .url(signedUrl)
-                .header("Referer", "${source.baseUrl}/")
-                .build()
-
-            source.client.newCall(imageRequest).execute().use { upstream ->
-                if (!upstream.isSuccessful) {
-                    return errorResponse(request, upstream.code, "Failed to fetch image: HTTP ${upstream.code}")
-                }
-                val bytes = upstream.body?.bytes() ?: ByteArray(0)
-                val contentType = upstream.header("Content-Type") ?: "image/avif"
-
-                Response.Builder()
-                    .request(request)
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(200)
-                    .message("OK")
-                    .body(bytes.toResponseBody(contentType.toMediaType()))
+            retrying { attempt ->
+                val imageRequest = Request.Builder()
+                    .url(signedUrl)
+                    .header("Referer", "${source.baseUrl}/")
                     .build()
+
+                source.client.newCall(imageRequest).execute().use { upstream ->
+                    if (!upstream.isSuccessful) {
+                        throw Exception("upstream image fetch failed: HTTP ${upstream.code} (attempt $attempt)")
+                    }
+                    val bytes = upstream.body?.bytes() ?: ByteArray(0)
+                    val contentType = upstream.header("Content-Type") ?: "image/avif"
+
+                    Response.Builder()
+                        .request(request)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(bytes.toResponseBody(contentType.toMediaType()))
+                        .build()
+                }
             }
         } catch (e: Exception) {
-            errorResponse(request, 500, e.message ?: "Failed to fetch protected image")
+            diagnosticImageResponse(request, "IMAGE: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
@@ -929,4 +962,54 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
         .message(message)
         .body(ByteArray(0).toResponseBody(null))
         .build()
+
+    /**
+     * بدل كرت خطأ Mihon العام ("HTTP 500")، نرسم النص الحقيقي للاستثناء داخل
+     * صورة JPEG صالحة (كود 200) بحيث يقدر المستخدم يشوفه مباشرة بدون أي أدوات
+     * تشخيص إضافية (logcat/PCAPdroid). يُستخدم فقط بعد استنفاد كل محاولات
+     * إعادة المحاولة التلقائية.
+     */
+    private fun diagnosticImageResponse(request: Request, message: String): Response {
+        val width = 900
+        val height = 500
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(android.graphics.Color.BLACK)
+
+        val paint = android.graphics.Paint().apply {
+            color = android.graphics.Color.RED
+            textSize = 26f
+            isAntiAlias = true
+        }
+
+        val words = message.split(" ")
+        val lines = mutableListOf<String>()
+        var current = StringBuilder()
+        for (word in words) {
+            val trial = if (current.isEmpty()) word else "$current $word"
+            if (paint.measureText(trial) > width - 40) {
+                lines.add(current.toString())
+                current = StringBuilder(word)
+            } else {
+                current = StringBuilder(trial)
+            }
+        }
+        if (current.isNotEmpty()) lines.add(current.toString())
+
+        lines.take(13).forEachIndexed { i, line ->
+            canvas.drawText(line, 20f, 40f + i * 34f, paint)
+        }
+
+        val output = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 92, output)
+        bitmap.recycle()
+
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .body(output.toByteArray().toResponseBody("image/jpeg".toMediaType()))
+            .build()
+    }
 }
