@@ -545,7 +545,9 @@ fun resolveMapEntry(
 
     val key = when (envelope.m) {
         "browser" -> deriveBrowserKey(chapterId)
-        "browser_session" -> fetchSessionKey(client, json, baseUrl, chapterId)
+        "browser_session" -> ProComicSessionKeyCache.getOrFetch(chapterId) {
+            fetchSessionKey(client, json, baseUrl, chapterId)
+        }
         else -> throw Exception("Unsupported reconstruction map method: ${envelope.m}")
     }
 
@@ -786,6 +788,37 @@ object ProComicImageCache {
     }
 
     fun get(chapterId: Long, imageIndex: Int): String? = cache[chapterId]?.getOrNull(imageIndex)
+}
+
+/**
+ * ذاكرة مؤقتة لمفتاح جلسة "browser_session" لكل فصل.
+ *
+ * المشكلة اللي تحلّها: Mihon يحمّل عدة صفحات بالتوازي، وكل صفحة كانت (قبل هذا
+ * الإصلاح) ترسل طلبها الخاص لـ GET /chapter-map-session-key/{chapterId} —
+ * يعني فصل فيه 17 صفحة محمية يرسل 17 طلب متزامن لنفس الـ endpoint. الخادم
+ * على الأغلب يعامل المفتاح كمفتاح جلسة صالح لاستخدام واحد أو يرفض الطلبات
+ * المتكررة/المتزامنة، وهذا يفسّر النمط الملحوظ: أول صفحة أو صفحتين تنجحان ثم
+ * تفشل أغلب الباقي بـ HTTP 500.
+ *
+ * الحل: نجلب المفتاح مرة واحدة فقط لكل chapterId ونعيد استخدام نفس النسخة
+ * لكل صفحات نفس الفصل. الـ synchronized على قفل خاص بكل فصل يضمن إنه لو
+ * وصلت عدة صفحات بنفس اللحظة (تحميل متوازي)، أول وحدة بس ترسل الطلب الفعلي
+ * والباقي ينتظر ويستخدم النتيجة المخزَّنة بدل تكرار الطلب.
+ */
+object ProComicSessionKeyCache {
+    private val cache = ConcurrentHashMap<Long, SecretKeySpec>()
+    private val locks = ConcurrentHashMap<Long, Any>()
+
+    fun getOrFetch(chapterId: Long, fetch: () -> SecretKeySpec): SecretKeySpec {
+        cache[chapterId]?.let { return it }
+        val lock = locks.getOrPut(chapterId) { Any() }
+        synchronized(lock) {
+            cache[chapterId]?.let { return it }
+            val key = fetch()
+            cache[chapterId] = key
+            return key
+        }
+    }
 }
 
 /**
