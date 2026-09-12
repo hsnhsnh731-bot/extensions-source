@@ -3,7 +3,9 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ImageDecoder
 import android.graphics.Rect
+import android.os.Build
 import android.util.Base64
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -38,6 +40,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
+import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -735,13 +738,43 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
     return rawPiece
 }
 
+/**
+ * يفكّ ترميز بايتات الصورة إلى Bitmap.
+ *
+ * السبب: قطع الصور القادمة من cdn2.procomic.pro بصيغة AVIF، و`BitmapFactory`
+ * القديم **لا يدعم AVIF إطلاقًا** على أغلب أجهزة أندرويد (هذا قيد معروف بمنصة
+ * أندرويد نفسها، وليس خطأ بكودنا) — فيرجع null بصمت لأي بايتات AVIF مهما كان
+ * حجمها أو محتواها. الدعم الفعلي لـ AVIF بأندرويد موجود فقط عبر `ImageDecoder`
+ * (متوفر من API 28، ويحتاج كودك AV1 مناسب بالجهاز، متوفر بأغلب أجهزة سامسونج
+ * الحديثة). هذا يفسّر ليش الفشل كان يظهر بشكل عشوائي/متقطع بدل نمط ثابت.
+ */
+private fun decodeBitmap(bytes: ByteArray): Bitmap {
+    BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        try {
+            val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+            return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+            }
+        } catch (e: Exception) {
+            throw Exception("ImageDecoder also failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    throw Exception("No available decoder for this image format (API ${Build.VERSION.SDK_INT})")
+}
+
 private fun downloadPieceBitmap(client: OkHttpClient, url: String): Bitmap = retrying {
     val request = Request.Builder().url(url).build()
     client.newCall(request).execute().use { response ->
         if (!response.isSuccessful) throw Exception("Failed to download piece: HTTP ${response.code} ($url)")
         val bytes = response.body?.bytes() ?: throw Exception("Empty piece body ($url)")
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            ?: throw Exception("Failed to decode piece bitmap ($url)")
+        try {
+            decodeBitmap(bytes)
+        } catch (e: Exception) {
+            throw Exception("Failed to decode piece bitmap (${e.message}) ($url)")
+        }
     }
 }
 
