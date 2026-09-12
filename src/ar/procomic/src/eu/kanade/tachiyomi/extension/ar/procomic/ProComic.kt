@@ -38,6 +38,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import org.aomedia.avif.android.AvifDecoder
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.nio.ByteBuffer
@@ -739,14 +740,15 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
 }
 
 /**
- * يفكّ ترميز بايتات الصورة إلى Bitmap.
+ * يفكّ ترميز بايتات الصورة إلى Bitmap، بثلاث محاولات متتالية:
  *
- * السبب: قطع الصور القادمة من cdn2.procomic.pro بصيغة AVIF، و`BitmapFactory`
- * القديم **لا يدعم AVIF إطلاقًا** على أغلب أجهزة أندرويد (هذا قيد معروف بمنصة
- * أندرويد نفسها، وليس خطأ بكودنا) — فيرجع null بصمت لأي بايتات AVIF مهما كان
- * حجمها أو محتواها. الدعم الفعلي لـ AVIF بأندرويد موجود فقط عبر `ImageDecoder`
- * (متوفر من API 28، ويحتاج كودك AV1 مناسب بالجهاز، متوفر بأغلب أجهزة سامسونج
- * الحديثة). هذا يفسّر ليش الفشل كان يظهر بشكل عشوائي/متقطع بدل نمط ثابت.
+ * 1) `BitmapFactory` — يفشل دائمًا مع AVIF (لا يدعمه إطلاقًا على معظم الأجهزة).
+ * 2) `ImageDecoder` (API 28+) — يدعم AVIF على الأجهزة اللي فيها كودك AV1، لكن
+ *    فيه علة معروفة بمنصة أندرويد نفسها مع صور AVIF بنمط "Grid/Tiled"
+ *    (بالضبط نوع قطعنا المقسّمة)، فيرمي IOException رغم إن الملف سليم 100%.
+ * 3) `libavif` (مكتبة Google الرسمية، native، مستقلة تمامًا عن فك ترميز
+ *    أندرويد) — تدعم AVIF بنمط Grid بشكل كامل وصحيح، وتحل بالضبط العلة اللي
+ *    تفشل فيها الخطوة السابقة.
  */
 private fun decodeBitmap(bytes: ByteArray): Bitmap {
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
@@ -758,11 +760,21 @@ private fun decodeBitmap(bytes: ByteArray): Bitmap {
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             }
         } catch (e: Exception) {
-            throw Exception("ImageDecoder also failed: ${e.javaClass.simpleName}: ${e.message}")
+            // نكمل لمسار libavif أدناه بدل رمي الاستثناء فورًا.
         }
     }
 
-    throw Exception("No available decoder for this image format (API ${Build.VERSION.SDK_INT})")
+    val buffer = ByteBuffer.wrap(bytes)
+    val info = AvifDecoder.Info()
+    if (!AvifDecoder.getInfo(buffer, bytes.size, info)) {
+        throw Exception("No available decoder could read this image (not valid AVIF either)")
+    }
+
+    val bitmap = Bitmap.createBitmap(info.width, info.height, Bitmap.Config.ARGB_8888)
+    if (!AvifDecoder.decode(buffer, bytes.size, bitmap)) {
+        throw Exception("libavif decode() returned failure")
+    }
+    return bitmap
 }
 
 private fun downloadPieceBitmap(client: OkHttpClient, url: String): Bitmap = retrying {
