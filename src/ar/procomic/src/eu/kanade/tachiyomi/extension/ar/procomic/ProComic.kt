@@ -682,16 +682,21 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
         return rawPiece
     }
 
-    if (rawPiece.startsWith("/")) {
-        return baseUrl.trimEnd('/') + rawPiece
-    }
+    // نعطي الأولوية لبادئة cdnPath (مثل cdn2.procomic.pro) بغض النظر عن وجود
+    // شرطة مائلة بأول المسار؛ مسارات القطع/الصور المحمية دائمًا على الـ CDN،
+    // وليست مسارات نسبية على procomic.pro نفسه.
+    val trimmedPiece = rawPiece.trimStart('/')
 
     if (!cdnPath.isNullOrBlank()) {
         return if (cdnPath.contains(".")) {
-            "https://$cdnPath/$rawPiece"
+            "https://$cdnPath/$trimmedPiece"
         } else {
-            "https://$cdnPath.procomic.pro/$rawPiece"
+            "https://$cdnPath.procomic.pro/$trimmedPiece"
         }
+    }
+
+    if (rawPiece.startsWith("/")) {
+        return baseUrl.trimEnd('/') + rawPiece
     }
 
     return rawPiece
