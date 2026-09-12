@@ -16,7 +16,6 @@ import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
-import keiyoushi.utils.jsonInstance
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -143,16 +142,22 @@ abstract class ProComic : KeiSource() {
             try {
                 val deferredData = fetchDeferredMedia(
                     client = client,
-                    json = jsonInstance,
+                    json = lenientJson,
                     baseUrl = baseUrl,
                     chapterId = chapterId,
                     deferredToken = deferredToken,
                     splitIndex = splitIndex,
                 )
 
-                // صور إضافية مباشرة (لو رجعت غير مشفّرة)
-                deferredData.images.forEach { imageUrl ->
-                    pages.add(Page(pages.size, imageUrl = imageUrl))
+                // صور إضافية: أحيانًا ترجع كروابط كاملة، وأحيانًا كمسارات نسبية
+                // (بدون host) تحتاج نفس آلية التوقيع اللي تحتاجها القطع المشفّرة.
+                // نمررها كلها عبر الـ Interceptor لضمان توقيعها الصحيح قبل الجلب.
+                if (deferredData.images.isNotEmpty()) {
+                    ProComicImageCache.store(chapterId, deferredData.images)
+                    deferredData.images.indices.forEach { imageIndex ->
+                        val internalUrl = "https://$PROCOMIC_IMAGE_HOST/$chapterId/$imageIndex"
+                        pages.add(Page(pages.size, imageUrl = internalUrl))
+                    }
                 }
 
                 // خرائط محمية تحتاج فك تشفير وتجميع قطع؛ نخزّنها بذاكرة مؤقتة
@@ -351,7 +356,16 @@ private const val STATIC_SALT =
 private const val GCM_TAG_LENGTH_BYTES = 16
 private const val GCM_TAG_LENGTH_BITS = GCM_TAG_LENGTH_BYTES * 8
 
+/**
+ * Json متساهل يتجاهل أي حقول إضافية غير متوقعة بردود الخادم (مثل حقول حماية
+ * أو تتبّع إضافية لم تُوثَّق بتحليل الجافاسكربت الأصلي). استخدام jsonInstance
+ * الافتراضي (الصارم) يتسبب برمي استثناء فوري لو ظهر حقل جديد، بدون أي طلب
+ * شبكة إضافي — وهذا بالضبط ما كان يفشل بصفحات "الوسائط المؤجلة" المحمية.
+ */
+private val lenientJson = Json { ignoreUnknownKeys = true }
+
 const val PROCOMIC_MAP_HOST = "procomic-map.internal"
+const val PROCOMIC_IMAGE_HOST = "procomic-image.internal"
 
 @Serializable
 data class DeferredMediaEnvelope(
@@ -755,7 +769,23 @@ object ProComicMapCache {
 }
 
 /**
- * يعترض الطلبات لروابط procomic-map.internal فقط، ويترك أي طلب آخر يمر بشكل طبيعي.
+ * ذاكرة مؤقتة لتخزين روابط الصور الإضافية (deferredMedia.images) الخاصة بكل
+ * فصل. بعض الفصول ترجع هذي الروابط كمسارات نسبية بدون host، فتحتاج تمريرها
+ * عبر resolvePieceUrl + آلية التوقيع قبل الجلب الفعلي، بدل استخدامها مباشرة.
+ */
+object ProComicImageCache {
+    private val cache = ConcurrentHashMap<Long, List<String>>()
+
+    fun store(chapterId: Long, images: List<String>) {
+        cache[chapterId] = images
+    }
+
+    fun get(chapterId: Long, imageIndex: Int): String? = cache[chapterId]?.getOrNull(imageIndex)
+}
+
+/**
+ * يعترض الطلبات لروابط procomic-map.internal و procomic-image.internal فقط،
+ * ويترك أي طلب آخر يمر بشكل طبيعي.
  */
 class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
 
@@ -763,10 +793,14 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
         val request = chain.request()
         val url = request.url
 
-        if (url.host != PROCOMIC_MAP_HOST) {
-            return chain.proceed(request)
+        return when (url.host) {
+            PROCOMIC_MAP_HOST -> interceptMap(request, url)
+            PROCOMIC_IMAGE_HOST -> interceptImage(request, url)
+            else -> chain.proceed(request)
         }
+    }
 
+    private fun interceptMap(request: Request, url: HttpUrl): Response {
         val chapterId = url.pathSegments.getOrNull(0)?.toLongOrNull()
         val mapIndex = url.pathSegments.getOrNull(1)?.toIntOrNull()
 
@@ -783,7 +817,7 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
         return try {
             val reconstructionMap = resolveMapEntry(
                 client = source.client,
-                json = jsonInstance,
+                json = lenientJson,
                 baseUrl = source.baseUrl,
                 chapterId = chapterId,
                 mapEntry = mapEntry,
@@ -804,6 +838,49 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
                 .build()
         } catch (e: Exception) {
             errorResponse(request, 500, e.message ?: "Failed to assemble protected page")
+        }
+    }
+
+    private fun interceptImage(request: Request, url: HttpUrl): Response {
+        val chapterId = url.pathSegments.getOrNull(0)?.toLongOrNull()
+        val imageIndex = url.pathSegments.getOrNull(1)?.toIntOrNull()
+
+        val rawImage = if (chapterId != null && imageIndex != null) {
+            ProComicImageCache.get(chapterId, imageIndex)
+        } else {
+            null
+        }
+
+        if (rawImage == null) {
+            return errorResponse(request, 404, "Protected image not found in cache")
+        }
+
+        return try {
+            val resolvedUrl = resolvePieceUrl(source.baseUrl, rawImage, "cdn2")
+            val signedUrl = buildSignedImageUrlSafely(source.client, source.baseUrl, resolvedUrl)
+
+            val imageRequest = Request.Builder()
+                .url(signedUrl)
+                .header("Referer", "${source.baseUrl}/")
+                .build()
+
+            source.client.newCall(imageRequest).execute().use { upstream ->
+                if (!upstream.isSuccessful) {
+                    return errorResponse(request, upstream.code, "Failed to fetch image: HTTP ${upstream.code}")
+                }
+                val bytes = upstream.body?.bytes() ?: ByteArray(0)
+                val contentType = upstream.header("Content-Type") ?: "image/avif"
+
+                Response.Builder()
+                    .request(request)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(bytes.toResponseBody(contentType.toMediaType()))
+                    .build()
+            }
+        } catch (e: Exception) {
+            errorResponse(request, 500, e.message ?: "Failed to fetch protected image")
         }
     }
 
