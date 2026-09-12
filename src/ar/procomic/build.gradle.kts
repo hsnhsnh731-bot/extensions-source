@@ -15,3 +15,7 @@ keiyoushi {
         baseUrl = "https://procomic.pro"
     }
 }
+
+dependencies {
+    implementation("org.aomedia.avif.android:avif:1.3.0.841110fd")
+}
