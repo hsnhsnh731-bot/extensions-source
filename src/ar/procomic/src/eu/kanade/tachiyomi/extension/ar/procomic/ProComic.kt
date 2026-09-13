@@ -812,7 +812,10 @@ private object AvifGridDecoder {
 
         fun u64(): Long {
             var v = 0L
-            repeat(8) { v = (v shl 8) or (data[pos].toLong() and 0xFF); pos++ }
+            repeat(8) {
+                v = (v shl 8) or (data[pos].toLong() and 0xFF)
+                pos++
+            }
             return v
         }
 
@@ -1040,7 +1043,9 @@ private object AvifGridDecoder {
                 writeU32(this, 0)
                 writeU32(this, 0)
                 write("pict".toByteArray(Charsets.US_ASCII))
-                writeU32(this, 0); writeU32(this, 0); writeU32(this, 0)
+                writeU32(this, 0)
+                writeU32(this, 0)
+                writeU32(this, 0)
                 write(0)
             }.toByteArray(),
         )
@@ -1204,11 +1209,17 @@ private object AvifGridDecoder {
 
         val colOffsets = IntArray(cols)
         var acc = 0
-        for (c in 0 until cols) { colOffsets[c] = acc; acc += colWidths[c] }
+        for (c in 0 until cols) {
+            colOffsets[c] = acc
+            acc += colWidths[c]
+        }
 
         val rowOffsets = IntArray(rows)
         acc = 0
-        for (r in 0 until rows) { rowOffsets[r] = acc; acc += rowHeights[r] }
+        for (r in 0 until rows) {
+            rowOffsets[r] = acc
+            acc += rowHeights[r]
+        }
 
         val fullWidth = colOffsets.last() + colWidths.last()
         val fullHeight = rowOffsets.last() + rowHeights.last()
