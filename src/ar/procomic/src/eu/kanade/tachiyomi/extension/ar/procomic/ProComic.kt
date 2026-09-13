@@ -765,6 +765,19 @@ private fun decodeBitmap(bytes: ByteArray): Bitmap {
     }
 
     val buffer = ByteBuffer.wrap(bytes)
+
+    // نحمّل المكتبة الأصلية (native) يدويًا وبشكل صريح قبل أي استدعاء لها،
+    // بدل الاعتماد فقط على التحميل التلقائي بداخل الكلاس. لو فشل هذا السطر
+    // تحديدًا، رسالة الخطأ (UnsatisfiedLinkError.message) تفصح عن السبب
+    // الحقيقي مباشرة: "library ... not found" يعني معمارية معالج الجهاز
+    // (ABI) غير متوفرة أصلًا بالـ APK، بخلاف رسالة "no implementation found"
+    // العامة اللي ما توضّح شي.
+    try {
+        System.loadLibrary("avif_android")
+    } catch (e: UnsatisfiedLinkError) {
+        throw Exception("libavif native library failed to load: ${e.message}")
+    }
+
     val info = AvifDecoder.Info()
     if (!AvifDecoder.getInfo(buffer, bytes.size, info)) {
         throw Exception("No available decoder could read this image (not valid AVIF either)")
@@ -950,7 +963,7 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
                 .message("OK")
                 .body(imageBytes.toResponseBody("image/jpeg".toMediaType()))
                 .build()
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             diagnosticImageResponse(request, "MAP #${mapEntry.method}: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
@@ -995,7 +1008,7 @@ class ProComicMapInterceptor(private val source: ProComic) : Interceptor {
                         .build()
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             diagnosticImageResponse(request, "IMAGE: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
