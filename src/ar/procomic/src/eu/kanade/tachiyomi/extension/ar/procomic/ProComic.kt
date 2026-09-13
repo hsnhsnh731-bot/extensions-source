@@ -38,7 +38,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import org.aomedia.avif.android.AvifDecoder
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.nio.ByteBuffer
@@ -744,11 +743,16 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
  *
  * 1) `BitmapFactory` — يفشل دائمًا مع AVIF (لا يدعمه إطلاقًا على معظم الأجهزة).
  * 2) `ImageDecoder` (API 28+) — يدعم AVIF على الأجهزة اللي فيها كودك AV1، لكن
- *    فيه علة معروفة بمنصة أندرويد نفسها مع صور AVIF بنمط "Grid/Tiled"
- *    (بالضبط نوع قطعنا المقسّمة)، فيرمي IOException رغم إن الملف سليم 100%.
- * 3) `libavif` (مكتبة Google الرسمية، native، مستقلة تمامًا عن فك ترميز
- *    أندرويد) — تدعم AVIF بنمط Grid بشكل كامل وصحيح، وتحل بالضبط العلة اللي
- *    تفشل فيها الخطوة السابقة.
+ *    فيه علة معروفة بمنصة أندرويد نفسها تحديدًا مع تجميع صور AVIF بنمط
+ *    "Grid" (صورة واحدة مقسّمة داخليًا لعدة بلاطات/tiles مشفّرة منفصلة).
+ * 3) `AvifGridDecoder` (كود Kotlin خالص أدناه، بدون أي مكتبة native) — يفكّك
+ *    بنية ملف AVIF يدويًا (نفس عائلة صيغ ISOBMFF/HEIF)، يستخرج كل بلاطة
+ *    كصورة AV1 مستقلة وصالحة بذاتها (حسب مواصفة HEIF كل بلاطة داخل Grid
+ *    لازم تكون قابلة لفك الترميز منفردة)، يبني ملف AVIF مصغّر صالح لكل
+ *    بلاطة على حدة ويمرره لـ `ImageDecoder` (يشتغل تمام هنا لأنه مو Grid)،
+ *    ثم يجمّع كل البلاطات يدويًا على Canvas. هذا يتجاوز علة أندرويد تمامًا
+ *    بدل الاعتماد على تجميعه الداخلي المعطوب، وبما إنه كود Kotlin خالص فهو
+ *    غير متأثر بقيد Mihon اللي منع استخدام مكتبة `libavif` الأصلية سابقًا.
  */
 private fun decodeBitmap(bytes: ByteArray): Bitmap {
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
@@ -760,21 +764,470 @@ private fun decodeBitmap(bytes: ByteArray): Bitmap {
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             }
         } catch (e: Exception) {
-            // نكمل لمسار libavif أدناه بدل رمي الاستثناء فورًا.
+            return AvifGridDecoder.decodeGrid(bytes)
         }
     }
 
-    val buffer = ByteBuffer.wrap(bytes)
-    val info = AvifDecoder.Info()
-    if (!AvifDecoder.getInfo(buffer, bytes.size, info)) {
-        throw Exception("No available decoder could read this image (not valid AVIF either)")
+    throw Exception("No available decoder for this image format (API ${Build.VERSION.SDK_INT})")
+}
+
+/**
+ * محلل ISOBMFF/HEIF/AVIF مصغّر، كود Kotlin خالص بدون أي اعتماد على مكتبات
+ * native. يفهم فقط الحد الأدنى المطلوب لاستخراج صور "Grid": صناديق
+ * ftyp/meta/mdat وما بداخل meta من iinf (أنواع العناصر)، iloc (مواقع بايتات
+ * كل عنصر)، iref (روابط dimg بين صورة الـ grid وبلاطاتها)، iprp/ipco/ipma
+ * (خصائص كل عنصر مثل الأبعاد ispe وإعدادات الترميز av1C).
+ */
+private object AvifGridDecoder {
+
+    private class ByteReader(private val data: ByteArray, var pos: Int = 0) {
+        fun u8(): Int {
+            val v = data[pos].toInt() and 0xFF
+            pos += 1
+            return v
+        }
+
+        fun u16(): Int {
+            val v = ((data[pos].toInt() and 0xFF) shl 8) or (data[pos + 1].toInt() and 0xFF)
+            pos += 2
+            return v
+        }
+
+        fun u24(): Int {
+            val v = ((data[pos].toInt() and 0xFF) shl 16) or
+                ((data[pos + 1].toInt() and 0xFF) shl 8) or
+                (data[pos + 2].toInt() and 0xFF)
+            pos += 3
+            return v
+        }
+
+        fun u32(): Long {
+            val v = ((data[pos].toLong() and 0xFF) shl 24) or
+                ((data[pos + 1].toLong() and 0xFF) shl 16) or
+                ((data[pos + 2].toLong() and 0xFF) shl 8) or
+                (data[pos + 3].toLong() and 0xFF)
+            pos += 4
+            return v
+        }
+
+        fun u64(): Long {
+            var v = 0L
+            repeat(8) { v = (v shl 8) or (data[pos].toLong() and 0xFF); pos++ }
+            return v
+        }
+
+        fun fourcc(): String {
+            val s = String(data, pos, 4, Charsets.US_ASCII)
+            pos += 4
+            return s
+        }
+
+        fun sized(size: Int): Long {
+            if (size == 0) return 0L
+            var v = 0L
+            repeat(size) { v = (v shl 8) or u8().toLong() }
+            return v
+        }
+
+        fun skip(n: Int) {
+            pos += n
+        }
     }
 
-    val bitmap = Bitmap.createBitmap(info.width, info.height, Bitmap.Config.ARGB_8888)
-    if (!AvifDecoder.decode(buffer, bytes.size, bitmap)) {
-        throw Exception("libavif decode() returned failure")
+    private class IsoBox(val type: String, val start: Int, val headerSize: Int, val end: Int) {
+        val bodyStart get() = start + headerSize
     }
-    return bitmap
+
+    private fun readBoxes(data: ByteArray, from: Int, to: Int): List<IsoBox> {
+        val boxes = mutableListOf<IsoBox>()
+        var pos = from
+        while (pos + 8 <= to) {
+            val r = ByteReader(data, pos)
+            val size32 = r.u32()
+            val type = r.fourcc()
+            var headerSize = 8
+            var boxSize = size32
+            if (size32 == 1L) {
+                boxSize = r.u64()
+                headerSize = 16
+            } else if (size32 == 0L) {
+                boxSize = (to - pos).toLong()
+            }
+            val end = pos + boxSize.toInt()
+            if (boxSize < headerSize || end > to) break
+            boxes.add(IsoBox(type, pos, headerSize, end))
+            pos = end
+        }
+        return boxes
+    }
+
+    private class ItemLocation(val baseOffset: Long, val extents: List<Pair<Long, Long>>, val constructionMethod: Int)
+
+    private fun extractItemBytes(data: ByteArray, loc: ItemLocation): ByteArray {
+        if (loc.constructionMethod != 0) {
+            throw Exception("unsupported iloc construction_method=${loc.constructionMethod}")
+        }
+        val out = ByteArrayOutputStream()
+        for ((offset, length) in loc.extents) {
+            val start = (loc.baseOffset + offset).toInt()
+            out.write(data, start, length.toInt())
+        }
+        return out.toByteArray()
+    }
+
+    private fun parseIinf(data: ByteArray, box: IsoBox): Map<Int, String> {
+        val r = ByteReader(data, box.bodyStart)
+        val version = r.u8()
+        r.skip(3)
+        val count = if (version == 0) r.u16() else r.u32().toInt()
+        val result = mutableMapOf<Int, String>()
+        for (infe in readBoxes(data, r.pos, box.end)) {
+            if (infe.type != "infe") continue
+            val ir = ByteReader(data, infe.bodyStart)
+            val infeVersion = ir.u8()
+            ir.skip(3)
+            when (infeVersion) {
+                2 -> {
+                    val itemId = ir.u16()
+                    ir.skip(2)
+                    result[itemId] = ir.fourcc()
+                }
+                3 -> {
+                    val itemId = ir.u32().toInt()
+                    ir.skip(2)
+                    result[itemId] = ir.fourcc()
+                }
+            }
+        }
+        if (count == 0 && result.isEmpty()) throw Exception("iinf: no items parsed")
+        return result
+    }
+
+    private fun parseIloc(data: ByteArray, box: IsoBox): Map<Int, ItemLocation> {
+        val r = ByteReader(data, box.bodyStart)
+        val version = r.u8()
+        r.skip(3)
+        val sizesByte1 = r.u8()
+        val offsetSize = (sizesByte1 shr 4) and 0xF
+        val lengthSize = sizesByte1 and 0xF
+        val sizesByte2 = r.u8()
+        val baseOffsetSize = (sizesByte2 shr 4) and 0xF
+        val indexSize = sizesByte2 and 0xF
+        val itemCount = if (version < 2) r.u16() else r.u32().toInt()
+
+        val result = mutableMapOf<Int, ItemLocation>()
+        repeat(itemCount) {
+            val itemId = if (version < 2) r.u16() else r.u32().toInt()
+            var constructionMethod = 0
+            if (version == 1 || version == 2) {
+                constructionMethod = r.u16() and 0xF
+            }
+            r.u16() // data_reference_index
+            val baseOffset = r.sized(baseOffsetSize)
+            val extentCount = r.u16()
+            val extents = mutableListOf<Pair<Long, Long>>()
+            repeat(extentCount) {
+                if ((version == 1 || version == 2) && indexSize > 0) {
+                    r.sized(indexSize)
+                }
+                val extentOffset = r.sized(offsetSize)
+                val extentLength = r.sized(lengthSize)
+                extents.add(extentOffset to extentLength)
+            }
+            result[itemId] = ItemLocation(baseOffset, extents, constructionMethod)
+        }
+        return result
+    }
+
+    private fun parseIref(data: ByteArray, box: IsoBox): Map<Int, List<Int>> {
+        val r = ByteReader(data, box.bodyStart)
+        val version = r.u8()
+        r.skip(3)
+        val result = mutableMapOf<Int, List<Int>>()
+        for (refBox in readBoxes(data, r.pos, box.end)) {
+            if (refBox.type != "dimg") continue
+            val rr = ByteReader(data, refBox.bodyStart)
+            val fromId = if (version == 0) rr.u16() else rr.u32().toInt()
+            val count = rr.u16()
+            val toIds = (0 until count).map { if (version == 0) rr.u16() else rr.u32().toInt() }
+            result[fromId] = toIds
+        }
+        return result
+    }
+
+    private fun parseIprp(data: ByteArray, box: IsoBox): Pair<List<IsoBox>, Map<Int, List<Int>>> {
+        val children = readBoxes(data, box.bodyStart, box.end)
+        val ipco = children.find { it.type == "ipco" } ?: throw Exception("iprp: no ipco box")
+        val properties = readBoxes(data, ipco.bodyStart, ipco.end)
+        val ipma = children.find { it.type == "ipma" } ?: throw Exception("iprp: no ipma box")
+
+        val r = ByteReader(data, ipma.bodyStart)
+        val version = r.u8()
+        val flags = r.u24()
+        val entryCount = r.u32().toInt()
+        val assoc = mutableMapOf<Int, List<Int>>()
+        repeat(entryCount) {
+            val itemId = if (version == 0) r.u16() else r.u32().toInt()
+            val assocCount = r.u8()
+            val indices = (0 until assocCount).map {
+                if (flags and 1 == 1) r.u16() and 0x7FFF else r.u8() and 0x7F
+            }
+            assoc[itemId] = indices
+        }
+        return properties to assoc
+    }
+
+    private fun findIspe(data: ByteArray, properties: List<IsoBox>, indices: List<Int>): Pair<Int, Int>? {
+        for (idx in indices) {
+            val p = properties.getOrNull(idx - 1) ?: continue
+            if (p.type == "ispe") {
+                val r = ByteReader(data, p.bodyStart)
+                r.skip(4)
+                return r.u32().toInt() to r.u32().toInt()
+            }
+        }
+        return null
+    }
+
+    private fun findAv1C(data: ByteArray, properties: List<IsoBox>, indices: List<Int>): ByteArray? {
+        for (idx in indices) {
+            val p = properties.getOrNull(idx - 1) ?: continue
+            if (p.type == "av1C") return data.copyOfRange(p.bodyStart, p.end)
+        }
+        return null
+    }
+
+    // ============================================================
+    // بناء ملف AVIF مصغّر يحتوي بلاطة واحدة فقط، صالح لفك الترميز عبر
+    // ImageDecoder العادي بأندرويد.
+    // ============================================================
+
+    private fun box(type: String, body: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream(8 + body.size)
+        writeU32(out, (8 + body.size).toLong())
+        out.write(type.toByteArray(Charsets.US_ASCII))
+        out.write(body)
+        return out.toByteArray()
+    }
+
+    private fun writeU32(out: ByteArrayOutputStream, v: Long) {
+        out.write(((v shr 24) and 0xFF).toInt())
+        out.write(((v shr 16) and 0xFF).toInt())
+        out.write(((v shr 8) and 0xFF).toInt())
+        out.write((v and 0xFF).toInt())
+    }
+
+    private fun writeU16(out: ByteArrayOutputStream, v: Int) {
+        out.write((v shr 8) and 0xFF)
+        out.write(v and 0xFF)
+    }
+
+    private fun buildStandaloneAvif(tileBytes: ByteArray, width: Int, height: Int, av1cBody: ByteArray): ByteArray {
+        val ftyp = box(
+            "ftyp",
+            ByteArrayOutputStream().apply {
+                write("avif".toByteArray(Charsets.US_ASCII))
+                writeU32(this, 0)
+                write("avif".toByteArray(Charsets.US_ASCII))
+                write("mif1".toByteArray(Charsets.US_ASCII))
+                write("miaf".toByteArray(Charsets.US_ASCII))
+            }.toByteArray(),
+        )
+
+        val hdlr = box(
+            "hdlr",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                writeU32(this, 0)
+                write("pict".toByteArray(Charsets.US_ASCII))
+                writeU32(this, 0); writeU32(this, 0); writeU32(this, 0)
+                write(0)
+            }.toByteArray(),
+        )
+
+        val pitm = box(
+            "pitm",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                writeU16(this, 1)
+            }.toByteArray(),
+        )
+
+        val infe = box(
+            "infe",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 2L shl 24)
+                writeU16(this, 1)
+                writeU16(this, 0)
+                write("av01".toByteArray(Charsets.US_ASCII))
+                write(0)
+            }.toByteArray(),
+        )
+        val iinf = box(
+            "iinf",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                writeU16(this, 1)
+                write(infe)
+            }.toByteArray(),
+        )
+
+        val ispe = box(
+            "ispe",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                writeU32(this, width.toLong())
+                writeU32(this, height.toLong())
+            }.toByteArray(),
+        )
+        val av1C = box("av1C", av1cBody)
+        val ipco = box("ipco", ispe + av1C)
+        val ipma = box(
+            "ipma",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                writeU32(this, 1)
+                writeU16(this, 1)
+                write(2)
+                write(1)
+                write(2)
+            }.toByteArray(),
+        )
+        val iprp = box("iprp", ipco + ipma)
+
+        // iloc بإزاحة مؤقتة صفر، فقط عشان نحسب حجمه الثابت (لا يتغير حسب
+        // قيمة الإزاحة نفسها، بس حسب عدد البايتات المستخدمة لتمثيلها).
+        fun buildIloc(dataOffset: Long): ByteArray = box(
+            "iloc",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                write((4 shl 4) or 4)
+                write((4 shl 4) or 0)
+                writeU16(this, 1)
+                writeU16(this, 1)
+                writeU16(this, 0)
+                writeU32(this, dataOffset)
+                writeU16(this, 1)
+                writeU32(this, 0)
+                writeU32(this, tileBytes.size.toLong())
+            }.toByteArray(),
+        )
+
+        val ilocPlaceholder = buildIloc(0)
+        val metaChildrenSizeWithoutIloc = hdlr.size + pitm.size + iinf.size + iprp.size
+        val metaBodySize = 4 + metaChildrenSizeWithoutIloc + ilocPlaceholder.size
+        val metaBoxSize = 8 + metaBodySize
+        val mdatDataOffset = ftyp.size + metaBoxSize + 8
+
+        val iloc = buildIloc(mdatDataOffset.toLong())
+
+        val meta = box(
+            "meta",
+            ByteArrayOutputStream().apply {
+                writeU32(this, 0)
+                write(hdlr)
+                write(pitm)
+                write(iinf)
+                write(iloc)
+                write(iprp)
+            }.toByteArray(),
+        )
+
+        val mdat = box("mdat", tileBytes)
+
+        val out = ByteArrayOutputStream(ftyp.size + meta.size + mdat.size)
+        out.write(ftyp)
+        out.write(meta)
+        out.write(mdat)
+        return out.toByteArray()
+    }
+
+    /** نقطة الدخول: يفكّ صورة AVIF من نمط Grid كاملة، ويرجعها كـ Bitmap مجمّع. */
+    fun decodeGrid(data: ByteArray): Bitmap {
+        val rootBoxes = readBoxes(data, 0, data.size)
+        val metaBox = rootBoxes.find { it.type == "meta" } ?: throw Exception("no meta box")
+        val metaChildren = readBoxes(data, metaBox.bodyStart + 4, metaBox.end)
+
+        val iinfBox = metaChildren.find { it.type == "iinf" } ?: throw Exception("no iinf box")
+        val itemTypes = parseIinf(data, iinfBox)
+        val gridItemId = itemTypes.entries.find { it.value == "grid" }?.key
+            ?: throw Exception("no grid item (not a Grid AVIF)")
+
+        val ilocBox = metaChildren.find { it.type == "iloc" } ?: throw Exception("no iloc box")
+        val ilocMap = parseIloc(data, ilocBox)
+
+        val irefBox = metaChildren.find { it.type == "iref" } ?: throw Exception("no iref box")
+        val tileItemIds = parseIref(data, irefBox)[gridItemId]
+            ?: throw Exception("no dimg reference for grid item $gridItemId")
+
+        val iprpBox = metaChildren.find { it.type == "iprp" } ?: throw Exception("no iprp box")
+        val (properties, propAssoc) = parseIprp(data, iprpBox)
+
+        val gridLoc = ilocMap[gridItemId] ?: throw Exception("no iloc entry for grid item")
+        val gridBytes = extractItemBytes(data, gridLoc)
+        val gr = ByteReader(gridBytes)
+        gr.u8()
+        val fieldIs32 = (gr.u8() and 1) == 1
+        val rows = gr.u8() + 1
+        val cols = gr.u8() + 1
+        val outputWidth = if (fieldIs32) gr.u32().toInt() else gr.u16()
+        val outputHeight = if (fieldIs32) gr.u32().toInt() else gr.u16()
+
+        if (tileItemIds.size != rows * cols) {
+            throw Exception("tile count mismatch: expected ${rows * cols}, got ${tileItemIds.size}")
+        }
+
+        val tileBitmaps = ArrayList<Bitmap>(tileItemIds.size)
+        val tileWidths = IntArray(tileItemIds.size)
+        val tileHeights = IntArray(tileItemIds.size)
+
+        for ((index, tileId) in tileItemIds.withIndex()) {
+            val loc = ilocMap[tileId] ?: throw Exception("no iloc for tile $tileId")
+            val tileRaw = extractItemBytes(data, loc)
+            val indices = propAssoc[tileId] ?: throw Exception("no properties for tile $tileId")
+            val (w, h) = findIspe(data, properties, indices) ?: throw Exception("no ispe for tile $tileId")
+            val av1c = findAv1C(data, properties, indices) ?: throw Exception("no av1C for tile $tileId")
+
+            val standalone = buildStandaloneAvif(tileRaw, w, h, av1c)
+            val source = ImageDecoder.createSource(ByteBuffer.wrap(standalone))
+            tileBitmaps.add(
+                ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                },
+            )
+            tileWidths[index] = w
+            tileHeights[index] = h
+        }
+
+        val colWidths = IntArray(cols) { c -> tileWidths[c] }
+        val rowHeights = IntArray(rows) { r -> tileHeights[r * cols] }
+
+        val colOffsets = IntArray(cols)
+        var acc = 0
+        for (c in 0 until cols) { colOffsets[c] = acc; acc += colWidths[c] }
+
+        val rowOffsets = IntArray(rows)
+        acc = 0
+        for (r in 0 until rows) { rowOffsets[r] = acc; acc += rowHeights[r] }
+
+        val fullWidth = colOffsets.last() + colWidths.last()
+        val fullHeight = rowOffsets.last() + rowHeights.last()
+
+        val finalBitmap = Bitmap.createBitmap(
+            outputWidth.coerceIn(1, fullWidth),
+            outputHeight.coerceIn(1, fullHeight),
+            Bitmap.Config.ARGB_8888,
+        )
+        val canvas = Canvas(finalBitmap)
+        for (r in 0 until rows) {
+            for (c in 0 until cols) {
+                val idx = r * cols + c
+                canvas.drawBitmap(tileBitmaps[idx], colOffsets[c].toFloat(), rowOffsets[r].toFloat(), null)
+                tileBitmaps[idx].recycle()
+            }
+        }
+        return finalBitmap
+    }
 }
 
 private fun downloadPieceBitmap(client: OkHttpClient, url: String): Bitmap = retrying {
