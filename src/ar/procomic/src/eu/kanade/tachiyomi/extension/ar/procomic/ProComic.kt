@@ -763,8 +763,15 @@ private fun decodeBitmap(bytes: ByteArray): Bitmap {
             return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
                 decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             }
-        } catch (e: Exception) {
-            return AvifGridDecoder.decodeGrid(bytes)
+        } catch (imageDecoderError: Exception) {
+            try {
+                return AvifGridDecoder.decodeGrid(bytes)
+            } catch (gridError: Exception) {
+                throw Exception(
+                    "ImageDecoder: ${imageDecoderError.javaClass.simpleName}: ${imageDecoderError.message} " +
+                        "|| GridDecoder: ${gridError.javaClass.simpleName}: ${gridError.message}",
+                )
+            }
         }
     }
 
@@ -1150,13 +1157,19 @@ private object AvifGridDecoder {
     /** نقطة الدخول: يفكّ صورة AVIF من نمط Grid كاملة، ويرجعها كـ Bitmap مجمّع. */
     fun decodeGrid(data: ByteArray): Bitmap {
         val rootBoxes = readBoxes(data, 0, data.size)
-        val metaBox = rootBoxes.find { it.type == "meta" } ?: throw Exception("no meta box")
+        val metaBox = rootBoxes.find { it.type == "meta" }
+            ?: throw Exception("no meta box (root types: ${rootBoxes.joinToString { it.type }}, size=${data.size})")
         val metaChildren = readBoxes(data, metaBox.bodyStart + 4, metaBox.end)
 
-        val iinfBox = metaChildren.find { it.type == "iinf" } ?: throw Exception("no iinf box")
+        val iinfBox = metaChildren.find { it.type == "iinf" }
+            ?: throw Exception("no iinf box (meta children: ${metaChildren.joinToString { it.type }})")
         val itemTypes = parseIinf(data, iinfBox)
         val gridItemId = itemTypes.entries.find { it.value == "grid" }?.key
-            ?: throw Exception("no grid item (not a Grid AVIF)")
+            ?: throw Exception(
+                "no grid item. found types: ${itemTypes.values.joinToString()} " +
+                    "| meta children: ${metaChildren.joinToString { it.type }} " +
+                    "| root: ${rootBoxes.joinToString { it.type }} size=${data.size}",
+            )
 
         val ilocBox = metaChildren.find { it.type == "iloc" } ?: throw Exception("no iloc box")
         val ilocMap = parseIloc(data, ilocBox)
