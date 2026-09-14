@@ -1,12 +1,17 @@
 package eu.kanade.tachiyomi.extension.ar.procomic
 
+import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.ImageDecoder
 import android.graphics.Rect
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
@@ -38,12 +43,16 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import uy.kohesive.injekt.Injekt
+import uy.kohesive.injekt.api.get
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -739,48 +748,137 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
 }
 
 /**
- * يفكّ ترميز بايتات الصورة إلى Bitmap، بأربع محاولات متتالية:
+ * يفكّ ترميز بايتات الصورة إلى Bitmap، بخمس محاولات متتالية (كل واحدة
+ * تُجرَّب فقط لو فشلت اللي قبلها):
  *
  * 1) `BitmapFactory` — يفشل دائمًا مع AVIF (لا يدعمه إطلاقًا على معظم الأجهزة).
  * 2) `ImageDecoder` (API 28+) — يدعم AVIF على الأجهزة اللي فيها كودك AV1، لكن
  *    فيه علة معروفة بمنصة أندرويد نفسها تفشل حتى مع صور AVIF **عادية وبسيطة**
  *    (تأكّد عمليًا: صورة بعنصر واحد فقط نوعه av01، بدون Grid إطلاقًا، ومع
- *    هذا يفشل فك ترميزها - يعني العلة أعمق من مجرد "Grid" كما افترضنا أول مرة).
- * 3) `AvifGridDecoder.decodeSingleItem` (كود Kotlin خالص، بدون أي مكتبة
- *    native) — يعيد بناء العنصر الوحيد بملف AVIF مصغّر ونظيف من الصفر
- *    (يشيل أي صندوق/خاصية زائدة بالملف الأصلي قد تكون سبب تعثّر أندرويد)،
- *    ويمرره لـ `ImageDecoder` من جديد. هذا يغطي أغلب حالات الفشل الفعلية.
+ *    هذا يفشل فك ترميزها - يعني العلة داخل كودك AV1 نفسه، مو بتغليف الملف).
+ * 3) `AvifGridDecoder.decodeSingleItem` — يعيد بناء العنصر الوحيد بملف AVIF
+ *    مصغّر ونظيف من الصفر، لاستبعاد احتمال إن السبب صندوق/خاصية زائدة.
  * 4) `AvifGridDecoder.decodeGrid` — للحالات النادرة اللي تكون فيها الصورة
- *    فعلاً من نوع Grid (عدة بلاطات/tiles)، يفكّك كل بلاطة لحالها ويجمّعها
- *    يدويًا على Canvas.
+ *    فعلاً من نوع Grid (عدة بلاطات/tiles).
+ * 5) `decodeViaWebView` — ملاذ أخير: يستخدم محرك Chromium المدمج بأندرويد
+ *    (عبر WebView) بدل كودك أندرويد الأساسي، لأن فك ترميز AVIF بمتصفح
+ *    Chrome أكمل وأنضج بكثير (يدعم حالات نادرة زي "film grain synthesis").
+ *    أبطأ بكثير من باقي الطرق، فيُستخدم فقط كملاذ أخير.
  */
 private fun decodeBitmap(bytes: ByteArray): Bitmap {
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
 
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-        try {
-            val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
-            return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
-                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-            }
-        } catch (imageDecoderError: Exception) {
-            try {
-                return AvifGridDecoder.decodeSingleItem(bytes)
-            } catch (singleItemError: Exception) {
-                try {
-                    return AvifGridDecoder.decodeGrid(bytes)
-                } catch (gridError: Exception) {
-                    throw Exception(
-                        "ImageDecoder: ${imageDecoderError.javaClass.simpleName}: ${imageDecoderError.message} " +
-                            "|| SingleItemRebuild: ${singleItemError.javaClass.simpleName}: ${singleItemError.message} " +
-                            "|| GridDecoder: ${gridError.javaClass.simpleName}: ${gridError.message}",
-                    )
-                }
-            }
-        }
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+        throw Exception("No available decoder for this image format (API ${Build.VERSION.SDK_INT})")
     }
 
-    throw Exception("No available decoder for this image format (API ${Build.VERSION.SDK_INT})")
+    val errors = mutableListOf<String>()
+
+    fun attempt(name: String, block: () -> Bitmap): Bitmap? = try {
+        block()
+    } catch (e: Exception) {
+        errors.add("$name: ${e.javaClass.simpleName}: ${e.message}")
+        null
+    }
+
+    attempt("ImageDecoder") {
+        val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+        ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+    }?.let { return it }
+
+    attempt("SingleItemRebuild") { AvifGridDecoder.decodeSingleItem(bytes) }?.let { return it }
+    attempt("GridDecoder") { AvifGridDecoder.decodeGrid(bytes) }?.let { return it }
+    attempt("WebView") { decodeViaWebView(bytes) }?.let { return it }
+
+    throw Exception(errors.joinToString(" || "))
+}
+
+/**
+ * جسر JavaScript ↔ Kotlin لاستقبال نتيجة فك الترميز من داخل WebView.
+ * كلاس عام (public) عمدًا: آلية `addJavascriptInterface` تعتمد على
+ * الانعكاس (reflection) وقد لا تعمل بشكل موثوق مع كلاسات مقيّدة الوصول.
+ */
+class ProComicJsBridge(private val onResult: (Boolean, String) -> Unit) {
+    @JavascriptInterface
+    fun onResult(ok: Boolean, payload: String) {
+        onResult(ok, payload)
+    }
+}
+
+/**
+ * يفكّ ترميز AVIF عبر محرك Chromium المدمج بأندرويد (WebView) بدل كودك
+ * النظام الأساسي. الخطوات:
+ * 1. نحوّل بايتات الصورة إلى data: URI ونحطها بوسم <img> داخل صفحة HTML مصغّرة.
+ * 2. لما تحمّل الصورة (onload)، نرسمها على <canvas> ونصدّرها كـ PNG (toDataURL)
+ *    — PNG دايمًا مدعوم بدون مشاكل عبر BitmapFactory العادي بعد كذا.
+ * 3. نستقبل نتيجة الـ JavaScript عبر جسر (JsBridge) بدل استطلاع (polling).
+ *
+ * WebView لازم يشتغل على الخيط الرئيسي (UI thread)؛ نستخدم Handler +
+ * CountDownLatch عشان الخيط الحالي (خيط الشبكة) ينتظر النتيجة بأمان.
+ */
+private fun decodeViaWebView(bytes: ByteArray): Bitmap {
+    val context = Injekt.get<Application>()
+    val inputBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+    val html = """
+        <html><body style="margin:0;padding:0">
+        <img id="i" src="data:image/avif;base64,$inputBase64">
+        <script>
+        var img = document.getElementById('i');
+        img.onload = function () {
+            try {
+                var c = document.createElement('canvas');
+                c.width = img.naturalWidth;
+                c.height = img.naturalHeight;
+                var ctx = c.getContext('2d');
+                ctx.drawImage(img, 0, 0);
+                AndroidBridge.onResult(true, c.toDataURL('image/png'));
+            } catch (e) {
+                AndroidBridge.onResult(false, String(e));
+            }
+        };
+        img.onerror = function () {
+            AndroidBridge.onResult(false, 'image element failed to load');
+        };
+        </script>
+        </body></html>
+    """.trimIndent()
+
+    val latch = CountDownLatch(1)
+    var success = false
+    var payload = ""
+    val webViewHolder = arrayOfNulls<WebView>(1)
+    val mainHandler = Handler(Looper.getMainLooper())
+
+    mainHandler.post {
+        val webView = WebView(context)
+        webViewHolder[0] = webView
+        webView.settings.javaScriptEnabled = true
+        webView.addJavascriptInterface(
+            ProComicJsBridge { ok, result ->
+                success = ok
+                payload = result
+                latch.countDown()
+            },
+            "AndroidBridge",
+        )
+        webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
+    }
+
+    val completed = latch.await(20, TimeUnit.SECONDS)
+    mainHandler.post { webViewHolder[0]?.destroy() }
+
+    if (!completed) throw Exception("WebView decode timed out")
+    if (!success) throw Exception("WebView decode failed: $payload")
+
+    val marker = "base64,"
+    val markerIndex = payload.indexOf(marker)
+    if (markerIndex == -1) throw Exception("WebView result missing base64 payload")
+
+    val pngBytes = Base64.decode(payload.substring(markerIndex + marker.length), Base64.DEFAULT)
+    return BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
+        ?: throw Exception("Failed to decode PNG produced by WebView")
 }
 
 /**
