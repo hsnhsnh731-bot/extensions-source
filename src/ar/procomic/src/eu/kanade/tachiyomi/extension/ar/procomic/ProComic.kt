@@ -739,20 +739,20 @@ fun resolvePieceUrl(baseUrl: String, rawPiece: String, cdnPath: String?): String
 }
 
 /**
- * يفكّ ترميز بايتات الصورة إلى Bitmap، بثلاث محاولات متتالية:
+ * يفكّ ترميز بايتات الصورة إلى Bitmap، بأربع محاولات متتالية:
  *
  * 1) `BitmapFactory` — يفشل دائمًا مع AVIF (لا يدعمه إطلاقًا على معظم الأجهزة).
  * 2) `ImageDecoder` (API 28+) — يدعم AVIF على الأجهزة اللي فيها كودك AV1، لكن
- *    فيه علة معروفة بمنصة أندرويد نفسها تحديدًا مع تجميع صور AVIF بنمط
- *    "Grid" (صورة واحدة مقسّمة داخليًا لعدة بلاطات/tiles مشفّرة منفصلة).
- * 3) `AvifGridDecoder` (كود Kotlin خالص أدناه، بدون أي مكتبة native) — يفكّك
- *    بنية ملف AVIF يدويًا (نفس عائلة صيغ ISOBMFF/HEIF)، يستخرج كل بلاطة
- *    كصورة AV1 مستقلة وصالحة بذاتها (حسب مواصفة HEIF كل بلاطة داخل Grid
- *    لازم تكون قابلة لفك الترميز منفردة)، يبني ملف AVIF مصغّر صالح لكل
- *    بلاطة على حدة ويمرره لـ `ImageDecoder` (يشتغل تمام هنا لأنه مو Grid)،
- *    ثم يجمّع كل البلاطات يدويًا على Canvas. هذا يتجاوز علة أندرويد تمامًا
- *    بدل الاعتماد على تجميعه الداخلي المعطوب، وبما إنه كود Kotlin خالص فهو
- *    غير متأثر بقيد Mihon اللي منع استخدام مكتبة `libavif` الأصلية سابقًا.
+ *    فيه علة معروفة بمنصة أندرويد نفسها تفشل حتى مع صور AVIF **عادية وبسيطة**
+ *    (تأكّد عمليًا: صورة بعنصر واحد فقط نوعه av01، بدون Grid إطلاقًا، ومع
+ *    هذا يفشل فك ترميزها - يعني العلة أعمق من مجرد "Grid" كما افترضنا أول مرة).
+ * 3) `AvifGridDecoder.decodeSingleItem` (كود Kotlin خالص، بدون أي مكتبة
+ *    native) — يعيد بناء العنصر الوحيد بملف AVIF مصغّر ونظيف من الصفر
+ *    (يشيل أي صندوق/خاصية زائدة بالملف الأصلي قد تكون سبب تعثّر أندرويد)،
+ *    ويمرره لـ `ImageDecoder` من جديد. هذا يغطي أغلب حالات الفشل الفعلية.
+ * 4) `AvifGridDecoder.decodeGrid` — للحالات النادرة اللي تكون فيها الصورة
+ *    فعلاً من نوع Grid (عدة بلاطات/tiles)، يفكّك كل بلاطة لحالها ويجمّعها
+ *    يدويًا على Canvas.
  */
 private fun decodeBitmap(bytes: ByteArray): Bitmap {
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
@@ -765,12 +765,17 @@ private fun decodeBitmap(bytes: ByteArray): Bitmap {
             }
         } catch (imageDecoderError: Exception) {
             try {
-                return AvifGridDecoder.decodeGrid(bytes)
-            } catch (gridError: Exception) {
-                throw Exception(
-                    "ImageDecoder: ${imageDecoderError.javaClass.simpleName}: ${imageDecoderError.message} " +
-                        "|| GridDecoder: ${gridError.javaClass.simpleName}: ${gridError.message}",
-                )
+                return AvifGridDecoder.decodeSingleItem(bytes)
+            } catch (singleItemError: Exception) {
+                try {
+                    return AvifGridDecoder.decodeGrid(bytes)
+                } catch (gridError: Exception) {
+                    throw Exception(
+                        "ImageDecoder: ${imageDecoderError.javaClass.simpleName}: ${imageDecoderError.message} " +
+                            "|| SingleItemRebuild: ${singleItemError.javaClass.simpleName}: ${singleItemError.message} " +
+                            "|| GridDecoder: ${gridError.javaClass.simpleName}: ${gridError.message}",
+                    )
+                }
             }
         }
     }
@@ -1155,7 +1160,18 @@ private object AvifGridDecoder {
     }
 
     /** نقطة الدخول: يفكّ صورة AVIF من نمط Grid كاملة، ويرجعها كـ Bitmap مجمّع. */
-    fun decodeGrid(data: ByteArray): Bitmap {
+    private class ParsedContainer(
+        val itemTypes: Map<Int, String>,
+        val ilocMap: Map<Int, ItemLocation>,
+        val dimgRefs: Map<Int, List<Int>>,
+        val properties: List<IsoBox>,
+        val propAssoc: Map<Int, List<Int>>,
+        val primaryItemId: Int?,
+        val rootTypes: List<String>,
+        val metaChildTypes: List<String>,
+    )
+
+    private fun parseContainer(data: ByteArray): ParsedContainer {
         val rootBoxes = readBoxes(data, 0, data.size)
         val metaBox = rootBoxes.find { it.type == "meta" }
             ?: throw Exception("no meta box (root types: ${rootBoxes.joinToString { it.type }}, size=${data.size})")
@@ -1164,22 +1180,77 @@ private object AvifGridDecoder {
         val iinfBox = metaChildren.find { it.type == "iinf" }
             ?: throw Exception("no iinf box (meta children: ${metaChildren.joinToString { it.type }})")
         val itemTypes = parseIinf(data, iinfBox)
-        val gridItemId = itemTypes.entries.find { it.value == "grid" }?.key
-            ?: throw Exception(
-                "no grid item. found types: ${itemTypes.values.joinToString()} " +
-                    "| meta children: ${metaChildren.joinToString { it.type }} " +
-                    "| root: ${rootBoxes.joinToString { it.type }} size=${data.size}",
-            )
 
         val ilocBox = metaChildren.find { it.type == "iloc" } ?: throw Exception("no iloc box")
         val ilocMap = parseIloc(data, ilocBox)
 
-        val irefBox = metaChildren.find { it.type == "iref" } ?: throw Exception("no iref box")
-        val tileItemIds = parseIref(data, irefBox)[gridItemId]
-            ?: throw Exception("no dimg reference for grid item $gridItemId")
+        val irefBox = metaChildren.find { it.type == "iref" }
+        val dimgRefs = if (irefBox != null) parseIref(data, irefBox) else emptyMap()
 
         val iprpBox = metaChildren.find { it.type == "iprp" } ?: throw Exception("no iprp box")
         val (properties, propAssoc) = parseIprp(data, iprpBox)
+
+        val pitmBox = metaChildren.find { it.type == "pitm" }
+        val primaryItemId = pitmBox?.let {
+            val r = ByteReader(data, it.bodyStart)
+            val version = r.u8()
+            r.skip(3)
+            if (version == 0) r.u16() else r.u32().toInt()
+        }
+
+        return ParsedContainer(
+            itemTypes,
+            ilocMap,
+            dimgRefs,
+            properties,
+            propAssoc,
+            primaryItemId,
+            rootBoxes.map { it.type },
+            metaChildren.map { it.type },
+        )
+    }
+
+    /**
+     * يعيد بناء العنصر الوحيد (الصورة الأساسية، مو Grid) بملف AVIF مصغّر
+     * ونظيف من الصفر، يحتوي فقط الحد الأدنى المطلوب لفك الترميز (ispe +
+     * av1C). الهدف: التخلص من أي صندوق/خاصية زائدة بالملف الأصلي قد تكون
+     * هي سبب تعثّر `ImageDecoder` المدمج بأندرويد، حتى مع صور AVIF عادية
+     * وبسيطة (غير Grid) كما تأكّد عمليًا.
+     */
+    fun decodeSingleItem(data: ByteArray): Bitmap {
+        val c = parseContainer(data)
+        val itemId = c.primaryItemId?.takeIf { c.itemTypes.containsKey(it) }
+            ?: c.itemTypes.entries.find { it.value == "av01" || it.value == "hvc1" }?.key
+            ?: throw Exception("no single image item found. types: ${c.itemTypes.values.joinToString()}")
+
+        val loc = c.ilocMap[itemId] ?: throw Exception("no iloc for item $itemId")
+        val raw = extractItemBytes(data, loc)
+        val indices = c.propAssoc[itemId] ?: throw Exception("no properties for item $itemId")
+        val (w, h) = findIspe(data, c.properties, indices) ?: throw Exception("no ispe for item $itemId")
+        val av1c = findAv1C(data, c.properties, indices) ?: throw Exception("no av1C for item $itemId")
+
+        val standalone = buildStandaloneAvif(raw, w, h, av1c)
+        val source = ImageDecoder.createSource(ByteBuffer.wrap(standalone))
+        return ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+            decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+        }
+    }
+
+    fun decodeGrid(data: ByteArray): Bitmap {
+        val c = parseContainer(data)
+        val gridItemId = c.itemTypes.entries.find { it.value == "grid" }?.key
+            ?: throw Exception(
+                "no grid item. found types: ${c.itemTypes.values.joinToString()} " +
+                    "| meta children: ${c.metaChildTypes.joinToString()} " +
+                    "| root: ${c.rootTypes.joinToString()} size=${data.size}",
+            )
+
+        val tileItemIds = c.dimgRefs[gridItemId]
+            ?: throw Exception("no dimg reference for grid item $gridItemId")
+
+        val ilocMap = c.ilocMap
+        val properties = c.properties
+        val propAssoc = c.propAssoc
 
         val gridLoc = ilocMap[gridItemId] ?: throw Exception("no iloc entry for grid item")
         val gridBytes = extractItemBytes(data, gridLoc)
