@@ -863,6 +863,18 @@ private fun decodeViaWebView(bytes: ByteArray): Bitmap {
             },
             "AndroidBridge",
         )
+
+        // WebView غير مرفق بأي نافذة أو شاشة فعلية (headless)، ومحرك Chromium
+        // يتعامل مع أي صفحة بأبعاد صفر/غير مقاسة كأنها "غير مرئية" ويؤجل
+        // معالجتها بالكامل (JS، تحميل الصور، رسم Canvas) — وهذا بالضبط سبب
+        // الـ Timeout. نعطيه أبعاد فعلية يدويًا (measure + layout) بدون
+        // الحاجة لإرفاقه بنافذة حقيقية، عشان يبدأ المعالجة فورًا.
+        val spec = android.view.View.MeasureSpec.makeMeasureSpec(1080, android.view.View.MeasureSpec.EXACTLY)
+        webView.measure(spec, spec)
+        webView.layout(0, 0, 1080, 1080)
+        webView.onResume()
+        webView.resumeTimers()
+
         webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null)
     }
 
